@@ -28,6 +28,8 @@ include_directories(
   include
 )
 
+option(SKIP_ROBOT_COMM "Disable robot communication" ON)
+
 add_executable(dual_arm_node src/dual_arm_node.cpp)
 target_include_directories(dual_arm_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -46,6 +48,10 @@ ament_target_dependencies(dual_arm_node
 target_link_libraries(dual_arm_node
   OpenArmCAN::openarm_can
 )
+
+if (SKIP_ROBOT_COMM)
+  target_compile_definitions(dual_arm_node PRIVATE SKIP_ROBOT_COMM)
+endif()
 
 install(
   DIRECTORY urdf/
