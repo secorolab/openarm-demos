@@ -7,6 +7,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <csignal>
 #include <assert.h>
 #include <time.h>
 #include <stdint.h>
@@ -16,6 +17,8 @@
 #include <std_msgs/msg/string.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+
+#include "openarm_compl_ctrl/msg/pid_debug.hpp"
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
@@ -44,6 +47,10 @@
 #define NUM_JOINTS 7
 
 std::atomic_bool shutting_down{false};
+
+void signal_handler(int /*signum*/) {
+    shutting_down.store(true);
+}
 
 
 class LowPassFilter {
@@ -98,6 +105,57 @@ double evaluate_bilateral_constraint(double quantity, double lower, double upper
         return 0.0;
 }
 
+struct JointLimits {
+    double lower[NUM_JOINTS];
+    double upper[NUM_JOINTS];
+};
+
+JointLimits get_arm_joint_limits() {
+    JointLimits limits;
+    limits.lower[0] = -1.396263;
+    limits.upper[0] = 3.490659;
+    limits.lower[1] = -1.745329;
+    limits.upper[1] = 1.745329;
+    limits.lower[2] = -1.570796;
+    limits.upper[2] = 1.570796;
+    limits.lower[3] = 0.0;
+    limits.upper[3] = 2.443461;
+    limits.lower[4] = -1.570796;
+    limits.upper[4] = 1.570796;
+    limits.lower[5] = -0.785398;
+    limits.upper[5] = 0.785398;
+    limits.lower[6] = -1.570796;
+    limits.upper[6] = 1.570796;
+    return limits;
+}
+
+KDL::JntArray compute_nullspace_limit_avoidance(
+    const KDL::JntArray& q,
+    const JointLimits& limits,
+    double margin,
+    double gain)
+{
+    KDL::JntArray tau(NUM_JOINTS);
+
+    for (int i = 0; i < NUM_JOINTS; ++i) {
+        double qi = q(i);
+        double q_lower = limits.lower[i] + margin;
+        double q_upper = limits.upper[i] - margin;
+
+        if (qi < q_lower) {
+            double error = qi - q_lower;
+            tau(i) = gain * error * error;
+        } else if (qi > q_upper) {
+            double error = qi - q_upper;
+            tau(i) = gain * error * error;
+        } else {
+            tau(i) = 0.0;
+        }
+    }
+
+    return tau;
+}
+
 class PIDController {
 public:
     PIDController(double kp, double ki, double kd,
@@ -128,12 +186,12 @@ public:
         }
 
         // ----- Proportional -----
-        double p_term = kp_ * error;
+        p_term_ = kp_ * error;
 
         // ----- Derivative (filtered) -----
         double raw_derivative = (error - previous_error_) / dt;
-        double filtered_derivative = derivative_filter_.update(raw_derivative);
-        double d_term = kd_ * raw_derivative;
+        // d_term_ = kd_ * raw_derivative;
+        d_term_ = kd_ * derivative_filter_.update(raw_derivative);
 
         // ----- Integral Update (before computing output) -----
         if (ki_ != 0.0) {
@@ -147,7 +205,7 @@ public:
             integral_ = std::clamp(integral_, integrator_min_, integrator_max_);
         }
 
-        double i_term = ki_ * integral_;
+        i_term_ = ki_ * integral_;
 
         // ----- Static friction compensation -----
         double friction = 0.0;
@@ -156,17 +214,26 @@ public:
         }
 
         // ----- Output -----
-        double output = p_term + i_term + d_term + friction;
-        double output_clamped = std::clamp(output, output_min_, output_max_);
+        double output = p_term_ + i_term_ + d_term_ + friction;
+        last_output_ = std::clamp(output, output_min_, output_max_);
 
         // ----- Anti-windup (back-calculation style) -----
-        if (ki_ != 0.0 && output != output_clamped) {
-            integral_ = (output_clamped - p_term - d_term - friction) / ki_;
+        if (ki_ != 0.0 && output != last_output_) {
+            integral_ = (last_output_ - p_term_ - d_term_ - friction) / ki_;
         }
 
         previous_error_ = error;
+        last_error_ = error;
 
-        return output_clamped;
+        return last_output_;
+    }
+
+    void get_debug_values(double& p, double& i, double& d, double& error, double& control_sig) const {
+        p = p_term_;
+        i = i_term_;
+        d = d_term_;
+        error = last_error_;
+        control_sig = last_output_;
     }
 
 private:
@@ -180,9 +247,22 @@ private:
     double previous_error_;
     bool first_update_;
 
+    double p_term_ = 0.0;
+    double i_term_ = 0.0;
+    double d_term_ = 0.0;
+    double last_error_ = 0.0;
+    double last_output_ = 0.0;
+
     LowPassFilter derivative_filter_;
 };
 
+struct PIDDebugData {
+    double p = 0.0;
+    double i = 0.0;
+    double d = 0.0;
+    double error = 0.0;
+    double control_sig = 0.0;
+};
 
 struct ArmState {
     KDL::JntArray q{NUM_JOINTS};
@@ -210,7 +290,9 @@ struct State {
     GripperState left_gripper;
     ArmState right;
     GripperState right_gripper;
-    
+
+    PIDDebugData left_ee_ang_vel_z_pid_debug;
+
     std::chrono::high_resolution_clock::time_point timestamp;
     uint64_t sequence_number = 0;
 };
@@ -303,34 +385,37 @@ public:
 
         control_sig_pub_ = create_publisher<geometry_msgs::msg::Twist>(
             "/debug_ee_vel_cntrl_sig", 10);
-        
+
+        pid_debug_pub_ = create_publisher<openarm_compl_ctrl::msg::PIDDebug>(
+            "/pid_debug_left_ee_ang_vel_z", 10);
+
         // Publishing timer - can handle bursts
         publish_timer_ = create_wall_timer(
-            std::chrono::milliseconds(2),
+            std::chrono::milliseconds(static_cast<int>(1000.0 / publish_rate_hz_)),
             std::bind(&OpenArmROSNode::publishCallback, this));
     }
 
 private:
     void publishCallback() {
-        // Check queue size
-        size_t queue_size = state_->queueSize();
-        
-        if (queue_size == 0) {
-            // No data available
-            return;
-        }
-    
+        // Drain the queue and publish only the most recent state.
+        // The control loop pushes at 1kHz but we publish at ~500Hz,
+        // so we must skip stale entries to avoid an ever-growing backlog.
         State state;
-        if (state_->popState(state)) {
+        bool have_state = false;
+        while (state_->popState(state)) {
+            have_state = true;
+        }
+        if (have_state) {
             publishState(state);
         }
     }
-    
+
     void publishState(const State& state) {
         sensor_msgs::msg::JointState msg;
         geometry_msgs::msg::Twist ee_vel_msg;
         geometry_msgs::msg::Twist error_msg;
         geometry_msgs::msg::Twist control_sig_msg;
+        openarm_compl_ctrl::msg::PIDDebug pid_debug_msg;
         
         // Convert timestamp to ROS time
         auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -371,23 +456,32 @@ private:
         control_sig_msg.angular.y = state.left.ee_vel_control_signal.rot.y();
         control_sig_msg.angular.z = state.left.ee_vel_control_signal.rot.z();
         
+        pid_debug_msg.p = state.left_ee_ang_vel_z_pid_debug.p;
+        pid_debug_msg.i = state.left_ee_ang_vel_z_pid_debug.i;
+        pid_debug_msg.d = state.left_ee_ang_vel_z_pid_debug.d;
+        pid_debug_msg.error = state.left_ee_ang_vel_z_pid_debug.error;
+        pid_debug_msg.control_sig = state.left_ee_ang_vel_z_pid_debug.control_sig;
+        
         joint_state_pub_->publish(msg);
         ee_vel_pub_->publish(ee_vel_msg);
         error_pub_->publish(error_msg);
         control_sig_pub_->publish(control_sig_msg);
-        
+        pid_debug_pub_->publish(pid_debug_msg);
+
         // Track publishing stats
         publish_count_++;
         last_published_seq_ = state.sequence_number;
     }
-    
+
     std::shared_ptr<RobotState> state_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr ee_vel_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr error_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr control_sig_pub_;
+    rclcpp::Publisher<openarm_compl_ctrl::msg::PIDDebug>::SharedPtr pid_debug_pub_;
     rclcpp::TimerBase::SharedPtr publish_timer_;
-    
+    int publish_rate_hz_ = 100;
+
     uint64_t publish_count_ = 0;
     uint64_t last_published_seq_ = 0;
 };
@@ -462,9 +556,13 @@ bool openarm_start(openarm::can::socket::OpenArm& arm) {
 
 void openarm_shutdown(openarm::can::socket::OpenArm& arm) {
     std::cout << "Shutting down arm..." << std::endl;
-    arm.disable_all();
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    arm.recv_all(2000);
+    // Send disable multiple times to ensure all motors receive the command,
+    // since a single CAN frame can be lost.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        arm.disable_all();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        arm.recv_all(2000);
+    }
 }
 
 void openarm_update(openarm::can::socket::OpenArm& arm,
@@ -484,8 +582,8 @@ void openarm_update(openarm::can::socket::OpenArm& arm,
         openarm::damiao_motor::MITParam{0.0, 0.0, 0.0, 0.0, gripper_state.tau_cmd}
     });
 
-    arm.refresh_all();
-    arm.recv_all();
+    // arm.refresh_all();
+    arm.recv_all(100);
 
     for (int i = 0; i < NUM_JOINTS; ++i) {
         arm_state.q(i) = arm.get_arm().get_motors()[i].get_position();
@@ -498,8 +596,15 @@ void openarm_update(openarm::can::socket::OpenArm& arm,
 }
 
 int main(int argc, char **argv) {
-    rclcpp::init(argc, argv);
-    
+    // Prevent rclcpp from installing its own SIGINT handler so we can
+    // guarantee motor shutdown runs before any ROS teardown.
+    rclcpp::InitOptions init_options;
+    init_options.shutdown_on_signal = false;
+    rclcpp::init(argc, argv, init_options);
+
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
     auto robot_state = std::make_shared<RobotState>();
     auto node = std::make_shared<OpenArmROSNode>(robot_state);
 
@@ -602,6 +707,10 @@ int main(int argc, char **argv) {
 
     KDL::JntArray ff_taus(num_joints_left);
 
+    JointLimits joint_limits = get_arm_joint_limits();
+    constexpr double LIMIT_MARGIN = 0.1;
+    constexpr double LIMIT_AVOIDANCE_GAIN = 2.0;
+
     KDL::Wrenches f_ext(num_segments_left);
     for (size_t i = 0; i < f_ext.size(); ++i) {
         f_ext[i] = KDL::Wrench::Zero();
@@ -610,12 +719,12 @@ int main(int argc, char **argv) {
     KDL::Jacobian alpha_left_world(num_constraints);
     KDL::JntArray beta_left(num_constraints);
     
-    alpha_left_world.setColumn(0, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0)));
+    alpha_left_world.setColumn(0, KDL::Twist(KDL::Vector(1, 0, 0), KDL::Vector(0, 0, 0)));
     alpha_left_world.setColumn(1, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
     alpha_left_world.setColumn(2, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
     alpha_left_world.setColumn(3, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
     alpha_left_world.setColumn(4, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
-    alpha_left_world.setColumn(5, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 1))); 
+    alpha_left_world.setColumn(5, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
            
     // transform world to respective arm base frame
     KDL::Frame f_left_base_inv = f_left_base.Inverse();
@@ -643,8 +752,6 @@ int main(int argc, char **argv) {
         LOG_ERROR(node, "Failed to compute feedforward torques for left arm: %d", r);
         return -1;
     }
-
-#ifndef SKIP_ROBOT_COMM
 
     // -------------------- OpenArm CAN Params --------------------
     constexpr std::array<openarm::damiao_motor::MotorType, 7> MOTOR_TYPES = {
@@ -703,41 +810,41 @@ int main(int argc, char **argv) {
         LOG_ERROR(node, "Failed to start left arm");
         return -1;
     }
-#endif
-
-
-#ifndef SKIP_ROBOT_COMM
 
     openarm_update(left_arm, state.left, state.left_gripper);
  
-    double left_ee_lin_vel_x_sp = 0.0; // m/s
+    double left_ee_lin_vel_x_sp = -0.1; // m/s
     double left_ee_lin_vel_y_sp = 0.0; // m/s
     double left_ee_lin_vel_z_sp = 0.0; // m/s
+
+    double test_ang_vel = 0.5; // rad/s
     double left_ee_ang_vel_x_sp = 0.0; // rad/s
     double left_ee_ang_vel_y_sp = 0.0; // rad/s
-    double left_ee_ang_vel_z_sp = 0.5; // rad/s
-    
-    double tube_threshold = 0.05; // m/s or rad/s
+    double left_ee_ang_vel_z_sp = 0.0; // rad/s
     
     // PID controllers
-    PIDController left_ee_lin_vel_x_pid(10.0, 0.0, 0.1, -20.0, 20.0, 10.0, 1000.0, 0.9, 5.0);
-    PIDController left_ee_lin_vel_y_pid(10.0, 0.0, 0.1, -20.0, 20.0, 10.0, 1000.0, 0.9, 5.0);
-    PIDController left_ee_lin_vel_z_pid(10.0, 0.0, 0.1, -20.0, 20.0, 10.0, 1000.0, 0.9, 5.0);
-    PIDController left_ee_ang_vel_x_pid(10.0, 0.0, 0.1, -20.0, 20.0, 10.0, 1000.0, 0.9, 5.0);
-    PIDController left_ee_ang_vel_y_pid(10.0, 0.0, 0.1, -20.0, 20.0, 10.0, 1000.0, 0.9, 5.0);
-    PIDController left_ee_ang_vel_z_pid(950.0, 20.0, 0.0, -1000.0, 1000.0, 20.0, 1000.0, 0.9, 20.0);
+    PIDController left_ee_lin_vel_x_pid(100.0, 0.0, 0.5, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
+    PIDController left_ee_lin_vel_y_pid(0.0, 0.0, 0.0, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
+    PIDController left_ee_lin_vel_z_pid(0.0, 0.0, 0.0, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
+
+    // with P=300, orientation works. 
+    // > 300 causes oscillations
+    PIDController left_ee_ang_vel_x_pid(0.0, 0.0, 0.0, -500.0, 500.0, 10.0, 1000.0, 0.9, 0.0);
+    PIDController left_ee_ang_vel_y_pid(0.0, 0.0, 0.0, -500.0, 500.0, 10.0, 1000.0, 0.9, 0.0);
+    PIDController left_ee_ang_vel_z_pid(0.0, 0.0, 0.0, -1000.0, 1000.0, 10.0, 1000.0, 0.9, 0.0);
+
     
-    constexpr double TAU_MAX = 0.8;
+    constexpr double TAU_MAX = 10.0;
     constexpr double DT      = 0.001; // 1000 Hz control loop
 
     LOG_INFO(node, "Starting control loop...");
 
-    // 1khz
-    auto desired_loop_rate = std::chrono::microseconds(2000);
+    // DT-based loop timing
+    auto desired_loop_rate = std::chrono::microseconds(static_cast<int>(DT * 1e6));
     auto now = std::chrono::high_resolution_clock::now();
     auto deadline = now + desired_loop_rate;
     
-    while (rclcpp::ok() && !shutting_down.load()) {
+    while (!shutting_down.load()) {
 
         left_q_qd = KDL::JntArrayVel(state.left.q, state.left.qd);
         KDL::FrameVel left_ee_fvel;
@@ -758,31 +865,6 @@ int main(int argc, char **argv) {
         double left_ee_ang_vel_y = left_ee_vel_world.rot.y();
         double left_ee_ang_vel_z = left_ee_vel_world.rot.z();
 
-        // double left_ee_lin_vel_x_error = evaluate_bilateral_constraint(
-        //                                     left_ee_lin_vel_x,
-        //                                     left_ee_lin_vel_x_sp - tube_threshold,
-        //                                     left_ee_lin_vel_x_sp + tube_threshold);
-        // double left_ee_lin_vel_y_error = evaluate_bilateral_constraint(
-        //                                     left_ee_lin_vel_y,
-        //                                     left_ee_lin_vel_y_sp - tube_threshold,
-        //                                     left_ee_lin_vel_y_sp + tube_threshold);
-        // double left_ee_lin_vel_z_error = evaluate_bilateral_constraint(
-        //                                     left_ee_lin_vel_z,
-        //                                     left_ee_lin_vel_z_sp - tube_threshold,
-        //                                     left_ee_lin_vel_z_sp + tube_threshold);
-        // double left_ee_ang_vel_x_error = evaluate_bilateral_constraint(
-        //                                     left_ee_ang_vel_x,
-        //                                     left_ee_ang_vel_x_sp - tube_threshold,
-        //                                     left_ee_ang_vel_x_sp + tube_threshold);
-        // double left_ee_ang_vel_y_error = evaluate_bilateral_constraint(
-        //                                     left_ee_ang_vel_y,
-        //                                     left_ee_ang_vel_y_sp - tube_threshold,
-        //                                     left_ee_ang_vel_y_sp + tube_threshold);
-        // double left_ee_ang_vel_z_error = evaluate_bilateral_constraint(
-        //                                     left_ee_ang_vel_z,
-        //                                     left_ee_ang_vel_z_sp - tube_threshold,
-        //                                     left_ee_ang_vel_z_sp + tube_threshold);
-
         double left_ee_lin_vel_x_error = evaluate_equality_constraint(left_ee_lin_vel_x, left_ee_lin_vel_x_sp);
         double left_ee_lin_vel_y_error = evaluate_equality_constraint(left_ee_lin_vel_y, left_ee_lin_vel_y_sp);
         double left_ee_lin_vel_z_error = evaluate_equality_constraint(left_ee_lin_vel_z, left_ee_lin_vel_z_sp);
@@ -790,11 +872,11 @@ int main(int argc, char **argv) {
         double left_ee_ang_vel_y_error = evaluate_equality_constraint(left_ee_ang_vel_y, left_ee_ang_vel_y_sp);
         double left_ee_ang_vel_z_error = evaluate_equality_constraint(left_ee_ang_vel_z, left_ee_ang_vel_z_sp);
 
-        double left_ee_lin_vel_x_cntrl_sig = 0 * left_ee_lin_vel_x_pid.control(left_ee_lin_vel_x_error, DT);
-        double left_ee_lin_vel_y_cntrl_sig = 0 * left_ee_lin_vel_y_pid.control(left_ee_lin_vel_y_error, DT);
-        double left_ee_lin_vel_z_cntrl_sig = 0 * left_ee_lin_vel_z_pid.control(left_ee_lin_vel_z_error, DT);
-        double left_ee_ang_vel_x_cntrl_sig = 0 * left_ee_ang_vel_x_pid.control(left_ee_ang_vel_x_error, DT);
-        double left_ee_ang_vel_y_cntrl_sig = 0 * left_ee_ang_vel_y_pid.control(left_ee_ang_vel_y_error, DT);
+        double left_ee_lin_vel_x_cntrl_sig = left_ee_lin_vel_x_pid.control(left_ee_lin_vel_x_error, DT);
+        double left_ee_lin_vel_y_cntrl_sig = left_ee_lin_vel_y_pid.control(left_ee_lin_vel_y_error, DT);
+        double left_ee_lin_vel_z_cntrl_sig = left_ee_lin_vel_z_pid.control(left_ee_lin_vel_z_error, DT);
+        double left_ee_ang_vel_x_cntrl_sig = left_ee_ang_vel_x_pid.control(left_ee_ang_vel_x_error, DT);
+        double left_ee_ang_vel_y_cntrl_sig = left_ee_ang_vel_y_pid.control(left_ee_ang_vel_y_error, DT);
         double left_ee_ang_vel_z_cntrl_sig = left_ee_ang_vel_z_pid.control(left_ee_ang_vel_z_error, DT);
         
         beta_left(0) = left_ee_lin_vel_x_cntrl_sig;
@@ -803,6 +885,12 @@ int main(int argc, char **argv) {
         beta_left(3) = left_ee_ang_vel_x_cntrl_sig;
         beta_left(4) = left_ee_ang_vel_y_cntrl_sig;
         beta_left(5) = left_ee_ang_vel_z_cntrl_sig;
+
+        KDL::JntArray limit_avoid_tau = compute_nullspace_limit_avoidance(
+            state.left.q, joint_limits, LIMIT_MARGIN, LIMIT_AVOIDANCE_GAIN);
+        for (int i = 0; i < num_joints_left; ++i) {
+            ff_taus(i) = limit_avoid_tau(i);
+        }
 
         achd_solver_left.CartToJnt(
                                 state.left.q,
@@ -826,7 +914,16 @@ int main(int argc, char **argv) {
             KDL::Vector(left_ee_lin_vel_x_cntrl_sig, left_ee_lin_vel_y_cntrl_sig, left_ee_lin_vel_z_cntrl_sig),
             KDL::Vector(left_ee_ang_vel_x_cntrl_sig, left_ee_ang_vel_y_cntrl_sig, left_ee_ang_vel_z_cntrl_sig)
         );
-        
+
+        // Populate PID debug message for left_ee_ang_vel_z controller
+        double p_term, i_term, d_term, error_val, ctrl_sig;
+        left_ee_lin_vel_x_pid.get_debug_values(p_term, i_term, d_term, error_val, ctrl_sig);
+        state.left_ee_ang_vel_z_pid_debug.p = p_term;
+        state.left_ee_ang_vel_z_pid_debug.i = i_term;
+        state.left_ee_ang_vel_z_pid_debug.d = d_term;
+        state.left_ee_ang_vel_z_pid_debug.error = error_val;
+        state.left_ee_ang_vel_z_pid_debug.control_sig = ctrl_sig;
+
         robot_state->update(state);
         
         openarm_update(left_arm, state.left, state.left_gripper);
@@ -840,14 +937,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    // shutdown
-    LOG_INFO(node, "Disabling arm's motors...");
+    // shutdown - disable motors before tearing down ROS
+    std::cout << "Disabling arm's motors..." << std::endl;
     openarm_shutdown(left_arm);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-    // TODO: this is not disabling all motors always - need to investigate further
-#endif
 
-    LOG_INFO(node, "Shutting down node...");
+    std::cout << "Shutting down node..." << std::endl;
     executor.cancel();
     rclcpp::shutdown();
     ros_thread.join();

@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD 20)
 find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -28,7 +29,9 @@ include_directories(
   include
 )
 
-option(SKIP_ROBOT_COMM "Disable robot communication" ON)
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/PIDDebug.msg"
+)
 
 add_executable(dual_arm_node src/dual_arm_node.cpp)
 target_include_directories(dual_arm_node PUBLIC
@@ -49,9 +52,9 @@ target_link_libraries(dual_arm_node
   OpenArmCAN::openarm_can
 )
 
-if (SKIP_ROBOT_COMM)
-  target_compile_definitions(dual_arm_node PRIVATE SKIP_ROBOT_COMM)
-endif()
+# Link against the generated message typesupport
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
+target_link_libraries(dual_arm_node "${cpp_typesupport_target}")
 
 install(
   DIRECTORY urdf/
