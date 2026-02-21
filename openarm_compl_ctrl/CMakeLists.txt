@@ -29,15 +29,44 @@ include_directories(
   include
 )
 
+
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PIDDebug.msg"
 )
 
-add_executable(dual_arm_node src/dual_arm_node.cpp)
-target_include_directories(dual_arm_node PUBLIC
+# Build openarm_comm library
+add_library(openarm_comm
+  src/openarm_comm.cpp)
+target_include_directories(openarm_comm PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
-ament_target_dependencies(dual_arm_node
+ament_target_dependencies(openarm_comm
+  OpenArmCAN
+)
+
+# Node executable
+# add_executable(dual_arm_node src/dual_arm_node.cpp)
+# target_include_directories(dual_arm_node PUBLIC
+#   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+#   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
+# ament_target_dependencies(dual_arm_node
+#   rclcpp
+#   ament_index_cpp
+#   std_msgs
+#   sensor_msgs
+#   geometry_msgs
+#   bdd_ros2_interfaces
+#   kdl_parser
+#   orocos_kdl
+#   openarm_description
+# )
+# target_link_libraries(openarm_comm OpenArmCAN::openarm_can)
+
+add_executable(cart_movement_node src/cart_movement_node.cpp)
+target_include_directories(cart_movement_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
+ament_target_dependencies(cart_movement_node
   rclcpp
   ament_index_cpp
   std_msgs
@@ -48,20 +77,26 @@ ament_target_dependencies(dual_arm_node
   orocos_kdl
   openarm_description
 )
-target_link_libraries(dual_arm_node
+target_link_libraries(cart_movement_node 
   OpenArmCAN::openarm_can
+  openarm_comm
 )
+
+install(TARGETS openarm_comm
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin)
 
 # Link against the generated message typesupport
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
-target_link_libraries(dual_arm_node "${cpp_typesupport_target}")
+target_link_libraries(cart_movement_node "${cpp_typesupport_target}")
 
 install(
   DIRECTORY urdf/
   DESTINATION share/${PROJECT_NAME}/urdf
 )
 
-install(TARGETS dual_arm_node
+install(TARGETS cart_movement_node
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

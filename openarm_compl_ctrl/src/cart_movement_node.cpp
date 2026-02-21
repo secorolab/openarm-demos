@@ -34,9 +34,9 @@
 #include "kdl/chainhdsolver_vereshchagin.hpp"
 #include "kdl/chainhdsolver_vereshchagin_fext.hpp"
 
+#include "openarm_compl_ctrl/openarm_comm.hpp"
 #include <openarm/can/socket/openarm.hpp>
 #include <openarm/damiao_motor/dm_motor_constants.hpp>
-#include "openarm_compl_ctrl/openarm_comm.hpp"
 
 
 #define LOG_INFO(node, msg, ...) RCLCPP_INFO(node->get_logger(), msg, ##__VA_ARGS__)
@@ -106,56 +106,6 @@ double evaluate_bilateral_constraint(double quantity, double lower, double upper
         return 0.0;
 }
 
-struct JointLimits {
-    double lower[NUM_JOINTS];
-    double upper[NUM_JOINTS];
-};
-
-JointLimits get_arm_joint_limits() {
-    JointLimits limits;
-    limits.lower[0] = -1.396263;
-    limits.upper[0] = 3.490659;
-    limits.lower[1] = -1.745329;
-    limits.upper[1] = 1.745329;
-    limits.lower[2] = -1.570796;
-    limits.upper[2] = 1.570796;
-    limits.lower[3] = 0.0;
-    limits.upper[3] = 2.443461;
-    limits.lower[4] = -1.570796;
-    limits.upper[4] = 1.570796;
-    limits.lower[5] = -0.785398;
-    limits.upper[5] = 0.785398;
-    limits.lower[6] = -1.570796;
-    limits.upper[6] = 1.570796;
-    return limits;
-}
-
-KDL::JntArray compute_nullspace_limit_avoidance(
-    const KDL::JntArray& q,
-    const JointLimits& limits,
-    double margin,
-    double gain)
-{
-    KDL::JntArray tau(NUM_JOINTS);
-
-    for (int i = 0; i < NUM_JOINTS; ++i) {
-        double qi = q(i);
-        double q_lower = limits.lower[i] + margin;
-        double q_upper = limits.upper[i] - margin;
-
-        if (qi < q_lower) {
-            double error = qi - q_lower;
-            tau(i) = gain * error * error;
-        } else if (qi > q_upper) {
-            double error = qi - q_upper;
-            tau(i) = gain * error * error;
-        } else {
-            tau(i) = 0.0;
-        }
-    }
-
-    return tau;
-}
 
 class PIDController {
 public:
@@ -265,7 +215,6 @@ struct PIDDebugData {
     double control_sig = 0.0;
 };
 
-// Use hardware-visible POD state from the library for joint-level storage.
 using openarm_compl_ctrl::ArmState;
 using openarm_compl_ctrl::GripperState;
 
@@ -275,16 +224,14 @@ struct State {
     ArmState right;
     GripperState right_gripper;
 
-    // Node-local control fields that use KDL types.
-    KDL::JntArray left_qdd{NUM_JOINTS};
-    KDL::JntArray right_qdd{NUM_JOINTS};
     KDL::JntArray left_tau_cmd{NUM_JOINTS};
     KDL::JntArray right_tau_cmd{NUM_JOINTS};
 
     KDL::FrameVel left_ee_fvel;
     KDL::FrameVel right_ee_fvel;
-    KDL::Twist left_ee_vel_error;
-    KDL::Twist left_ee_vel_control_signal;
+
+    double left_gripper_tau_cmd = 0.0;
+    double right_gripper_tau_cmd = 0.0;
 
     PIDDebugData left_ee_ang_vel_z_pid_debug;
 
@@ -363,6 +310,7 @@ public:
     }
 };
 
+
 class OpenArmROSNode : public rclcpp::Node {
 public:
     OpenArmROSNode(std::shared_ptr<RobotState> state) 
@@ -372,17 +320,8 @@ public:
         joint_state_pub_ = create_publisher<sensor_msgs::msg::JointState>(
             "/debug_js", 10);
 
-        ee_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>(
-            "/debug_ee_vel", 10);
-
-        error_pub_ = create_publisher<geometry_msgs::msg::Twist>(
-            "/debug_ee_vel_error", 10);
-
-        control_sig_pub_ = create_publisher<geometry_msgs::msg::Twist>(
-            "/debug_ee_vel_cntrl_sig", 10);
-
         pid_debug_pub_ = create_publisher<openarm_compl_ctrl::msg::PIDDebug>(
-            "/pid_debug_left_ee_ang_vel_z", 10);
+            "/pid_debug", 10);
 
         // Publishing timer - can handle bursts
         publish_timer_ = create_wall_timer(
@@ -407,9 +346,6 @@ private:
 
     void publishState(const State& state) {
         sensor_msgs::msg::JointState msg;
-        geometry_msgs::msg::Twist ee_vel_msg;
-        geometry_msgs::msg::Twist error_msg;
-        geometry_msgs::msg::Twist control_sig_msg;
         openarm_compl_ctrl::msg::PIDDebug pid_debug_msg;
         
         // Convert timestamp to ROS time
@@ -425,43 +361,14 @@ private:
         msg.effort.resize(7);
         
         for (int i = 0; i < 7; ++i) {
-        msg.position[i] = state.left.q[i];
-        msg.velocity[i] = state.left.qd[i];
-        msg.effort[i] = state.left_tau_cmd(i);
+            msg.position[i] = state.left.q[i];
+            msg.velocity[i] = state.left.qd[i];
+            msg.effort[i] = state.left_tau_cmd(i);
         }
 
-        ee_vel_msg.linear.x = state.left_ee_fvel.GetTwist().vel.x();
-        ee_vel_msg.linear.y = state.left_ee_fvel.GetTwist().vel.y();
-        ee_vel_msg.linear.z = state.left_ee_fvel.GetTwist().vel.z();
-        ee_vel_msg.angular.x = state.left_ee_fvel.GetTwist().rot.x();
-        ee_vel_msg.angular.y = state.left_ee_fvel.GetTwist().rot.y();
-        ee_vel_msg.angular.z = state.left_ee_fvel.GetTwist().rot.z();
-
-        error_msg.linear.x = state.left_ee_vel_error.vel.x();
-        error_msg.linear.y = state.left_ee_vel_error.vel.y();
-        error_msg.linear.z = state.left_ee_vel_error.vel.z();
-        error_msg.angular.x = state.left_ee_vel_error.rot.x();
-        error_msg.angular.y = state.left_ee_vel_error.rot.y();
-        error_msg.angular.z = state.left_ee_vel_error.rot.z();
-
-        control_sig_msg.linear.x = state.left_ee_vel_control_signal.vel.x();
-        control_sig_msg.linear.y = state.left_ee_vel_control_signal.vel.y();
-        control_sig_msg.linear.z = state.left_ee_vel_control_signal.vel.z();
-        control_sig_msg.angular.x = state.left_ee_vel_control_signal.rot.x();
-        control_sig_msg.angular.y = state.left_ee_vel_control_signal.rot.y();
-        control_sig_msg.angular.z = state.left_ee_vel_control_signal.rot.z();
-        
-        pid_debug_msg.p = state.left_ee_ang_vel_z_pid_debug.p;
-        pid_debug_msg.i = state.left_ee_ang_vel_z_pid_debug.i;
-        pid_debug_msg.d = state.left_ee_ang_vel_z_pid_debug.d;
-        pid_debug_msg.error = state.left_ee_ang_vel_z_pid_debug.error;
-        pid_debug_msg.control_sig = state.left_ee_ang_vel_z_pid_debug.control_sig;
         
         joint_state_pub_->publish(msg);
-        ee_vel_pub_->publish(ee_vel_msg);
-        error_pub_->publish(error_msg);
-        control_sig_pub_->publish(control_sig_msg);
-        pid_debug_pub_->publish(pid_debug_msg);
+        // pid_debug_pub_->publish(pid_debug_msg);
 
         // Track publishing stats
         publish_count_++;
@@ -470,9 +377,6 @@ private:
 
     std::shared_ptr<RobotState> state_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr ee_vel_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr error_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr control_sig_pub_;
     rclcpp::Publisher<openarm_compl_ctrl::msg::PIDDebug>::SharedPtr pid_debug_pub_;
     rclcpp::TimerBase::SharedPtr publish_timer_;
     int publish_rate_hz_ = 100;
@@ -481,11 +385,10 @@ private:
     uint64_t last_published_seq_ = 0;
 };
 
+
 using openarm_compl_ctrl::ArmHardwareConfig;
 
 int main(int argc, char **argv) {
-    // Prevent rclcpp from installing its own SIGINT handler so we can
-    // guarantee motor shutdown runs before any ROS teardown.
     rclcpp::InitOptions init_options;
     init_options.shutdown_on_signal = false;
     rclcpp::init(argc, argv, init_options);
@@ -569,7 +472,7 @@ int main(int argc, char **argv) {
 
     LOG_INFO(node, "Left arm chain has %d segments and %d joints", num_segments_left, num_joints_left);
 
-    assert(num_segments_left == num_joints_left && "Left arm has unexpected number of segments");
+    // assert(num_segments_left == num_joints_left && "Left arm has unexpected number of segments");
     assert(num_segments_right == num_joints_right && "Right arm has unexpected number of segments");
     
     LOG_INFO_S(node, "Left arm gravity in base frame: " << g_left_base);
@@ -595,10 +498,6 @@ int main(int argc, char **argv) {
 
     KDL::JntArray ff_taus(num_joints_left);
 
-    JointLimits joint_limits = get_arm_joint_limits();
-    constexpr double LIMIT_MARGIN = 0.1;
-    constexpr double LIMIT_AVOIDANCE_GAIN = 2.0;
-
     KDL::Wrenches f_ext(num_segments_left);
     for (size_t i = 0; i < f_ext.size(); ++i) {
         f_ext[i] = KDL::Wrench::Zero();
@@ -608,11 +507,11 @@ int main(int argc, char **argv) {
     KDL::JntArray beta_left(num_constraints);
     
     alpha_left_world.setColumn(0, KDL::Twist(KDL::Vector(1, 0, 0), KDL::Vector(0, 0, 0)));
-    alpha_left_world.setColumn(1, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
-    alpha_left_world.setColumn(2, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
-    alpha_left_world.setColumn(3, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
-    alpha_left_world.setColumn(4, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
-    alpha_left_world.setColumn(5, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
+    alpha_left_world.setColumn(1, KDL::Twist(KDL::Vector(0, 1, 0), KDL::Vector(0, 0, 0))); 
+    alpha_left_world.setColumn(2, KDL::Twist(KDL::Vector(0, 0, 1), KDL::Vector(0, 0, 0))); 
+    alpha_left_world.setColumn(3, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(1, 0, 0))); 
+    alpha_left_world.setColumn(4, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 1, 0))); 
+    alpha_left_world.setColumn(5, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 1))); 
            
     // transform world to respective arm base frame
     KDL::Frame f_left_base_inv = f_left_base.Inverse();
@@ -624,30 +523,31 @@ int main(int argc, char **argv) {
 
     KDL::ChainFkSolverVel_recursive fk_vel_solver_left(left_arm_chain);
 
-    KDL::FrameVel left_ee_fvel, right_ee_fvel;
+    KDL::FrameVel left_ee_fvel;
     KDL::JntArrayVel left_q_qd(num_joints_left);
 
     fk_vel_solver_left.JntToCart(left_q_qd, left_ee_fvel);
 
-    // Build temporaries for KDL calls (library state stores POD arrays)
-    KDL::JntArray tmp_q(NUM_JOINTS), tmp_qd(NUM_JOINTS);
+
+    KDL::JntArray leftarm_q(NUM_JOINTS), leftarm_qd(NUM_JOINTS), leftarm_qdd(NUM_JOINTS);
+    KDL::JntArray leftarm_tau_cmd(NUM_JOINTS);
+
     for (int i = 0; i < NUM_JOINTS; ++i) {
-        tmp_q(i) = state.left.q[i];
-        tmp_qd(i) = state.left.qd[i];
+        leftarm_q(i) = state.left.q[i];
+        leftarm_qd(i) = state.left.qd[i];
     }
     int r = achd_solver_left.CartToJnt(
-                                    tmp_q,
-                                    tmp_qd,
-                                    state.left_qdd,
+                                    leftarm_q,
+                                    leftarm_qd,
+                                    leftarm_qdd,
                                     alpha_left, beta_left, 
                                     f_ext, ff_taus, 
-                                    state.left_tau_cmd);
+                                    leftarm_tau_cmd);
     if (r < 0) {
         LOG_ERROR(node, "Failed to compute feedforward torques for left arm: %d", r);
         return -1;
     }
 
-    // Use defaults provided by openarm_comm; override interface if needed
     ArmHardwareConfig left_arm_config = openarm_compl_ctrl::make_default_arm_config("can1");
 
     openarm::can::socket::OpenArm left_arm(left_arm_config.can_interface, true);
@@ -662,46 +562,29 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    // Initial hardware sync — controller provides MIT commands built from
-    // the node-level tau_cmd values.
-    openarm_compl_ctrl::ArmState astate;
-    openarm_compl_ctrl::GripperState gstate;
-    {
-        std::vector<openarm::damiao_motor::MITParam> mit;
-        mit.reserve(NUM_JOINTS);
-        for (int i = 0; i < NUM_JOINTS; ++i) {
-            mit.push_back(openarm::damiao_motor::MITParam{0.0,0.0,0.0,0.0,state.left_tau_cmd(i)});
-        }
-        astate.mit_cmd = std::move(mit);
-    }
-    // No gripper torque command at startup; send zero command
-    gstate.g_mit_cmd = openarm::damiao_motor::MITParam{0.0,0.0,0.0,0.0,0.0};
-    openarm_compl_ctrl::openarm_update(left_arm, astate, gstate);
-    for (int i = 0; i < 7; ++i) {
-        state.left.q[i] = astate.q[i];
-        state.left.qd[i] = astate.qd[i];
-        state.left.tau_mes[i] = astate.tau_mes[i];
-    }
-    state.left_gripper.q = gstate.q;
-    state.left_gripper.qd = gstate.qd;
-    state.left_gripper.tau_mes = gstate.tau_mes;
- 
-    double left_ee_lin_vel_x_sp = -0.1; // m/s
-    double left_ee_lin_vel_y_sp = 0.0; // m/s
-    double left_ee_lin_vel_z_sp = 0.0; // m/s
+    openarm_compl_ctrl::ArmState leftarm_state = {};
+    leftarm_state.mit_cmd.resize(NUM_JOINTS);
+    openarm_compl_ctrl::GripperState leftg_state = {};
 
-    double test_ang_vel = 0.5; // rad/s
-    double left_ee_ang_vel_x_sp = 0.0; // rad/s
-    double left_ee_ang_vel_y_sp = 0.0; // rad/s
-    double left_ee_ang_vel_z_sp = 0.0; // rad/s
+    openarm::damiao_motor::MITParam zero_mit;
+    leftg_state.mit_cmd = zero_mit;
+    openarm_compl_ctrl::openarm_update(left_arm, leftarm_state, leftg_state);
+    // copy back
+    for (int i = 0; i < NUM_JOINTS; ++i) {
+        state.left.q[i] = leftarm_state.q[i];
+        state.left.qd[i] = leftarm_state.qd[i];
+        state.left.tau_mes[i] = leftarm_state.tau_mes[i];
+    }
+    state.left_gripper.q = leftg_state.q;
+    state.left_gripper.qd = leftg_state.qd;
+    state.left_gripper.tau_mes = leftg_state.tau_mes;
+ 
     
     // PID controllers
     PIDController left_ee_lin_vel_x_pid(100.0, 0.0, 0.5, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
     PIDController left_ee_lin_vel_y_pid(0.0, 0.0, 0.0, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
     PIDController left_ee_lin_vel_z_pid(0.0, 0.0, 0.0, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
 
-    // with P=300, orientation works. 
-    // > 300 causes oscillations
     PIDController left_ee_ang_vel_x_pid(0.0, 0.0, 0.0, -500.0, 500.0, 10.0, 1000.0, 0.9, 0.0);
     PIDController left_ee_ang_vel_y_pid(0.0, 0.0, 0.0, -500.0, 500.0, 10.0, 1000.0, 0.9, 0.0);
     PIDController left_ee_ang_vel_z_pid(0.0, 0.0, 0.0, -1000.0, 1000.0, 10.0, 1000.0, 0.9, 0.0);
@@ -717,101 +600,75 @@ int main(int argc, char **argv) {
     auto now = std::chrono::high_resolution_clock::now();
     auto deadline = now + desired_loop_rate;
     
+
     while (!shutting_down.load()) {
 
-        // Build temporaries from POD hardware state for KDL calls
-        KDL::JntArray tmp_q(NUM_JOINTS), tmp_qd(NUM_JOINTS);
         for (int i = 0; i < NUM_JOINTS; ++i) {
-            tmp_q(i) = state.left.q[i];
-            tmp_qd(i) = state.left.qd[i];
+            leftarm_q(i) = state.left.q[i];
+            leftarm_qd(i) = state.left.qd[i];
         }
 
-        KDL::JntArrayVel left_q_qd(tmp_q, tmp_qd);
-        KDL::FrameVel left_ee_fvel;
+        KDL::JntArrayVel left_q_qd(leftarm_q, leftarm_qd);
         fk_vel_solver_left.JntToCart(left_q_qd, left_ee_fvel);
 
         KDL::Frame left_ee_frame = left_ee_fvel.GetFrame();
         KDL::Twist left_ee_vel = left_ee_fvel.GetTwist();
 
+        // Transform end-effector frame and velocity to world frame for constraint evaluation
         KDL::Frame left_ee_frame_world = f_left_base * left_ee_frame;
         KDL::Twist left_ee_vel_world = f_left_base * left_ee_vel;
 
-        // Store KDL-only values in node-local fields
-        state.left_ee_fvel = KDL::FrameVel(left_ee_frame_world, left_ee_vel_world);
+        left_ee_fvel = KDL::FrameVel(left_ee_frame_world, left_ee_vel_world);
 
-        double left_ee_lin_vel_x = left_ee_vel_world.vel.x();
-        double left_ee_lin_vel_y = left_ee_vel_world.vel.y();
-        double left_ee_lin_vel_z = left_ee_vel_world.vel.z();
-        double left_ee_ang_vel_x = left_ee_vel_world.rot.x();
-        double left_ee_ang_vel_y = left_ee_vel_world.rot.y();
-        double left_ee_ang_vel_z = left_ee_vel_world.rot.z();
+        std::cout << "Left EE Position (world): " << left_ee_frame_world.p << std::endl;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        double left_ee_lin_vel_x_error = evaluate_equality_constraint(left_ee_lin_vel_x, left_ee_lin_vel_x_sp);
-        double left_ee_lin_vel_y_error = evaluate_equality_constraint(left_ee_lin_vel_y, left_ee_lin_vel_y_sp);
-        double left_ee_lin_vel_z_error = evaluate_equality_constraint(left_ee_lin_vel_z, left_ee_lin_vel_z_sp);
-        double left_ee_ang_vel_x_error = evaluate_equality_constraint(left_ee_ang_vel_x, left_ee_ang_vel_x_sp);
-        double left_ee_ang_vel_y_error = evaluate_equality_constraint(left_ee_ang_vel_y, left_ee_ang_vel_y_sp);
-        double left_ee_ang_vel_z_error = evaluate_equality_constraint(left_ee_ang_vel_z, left_ee_ang_vel_z_sp);
+        beta_left(0) = 0.0;
+        beta_left(1) = 0.0;
+        beta_left(2) = 0.0;
+        beta_left(3) = 0.0;
+        beta_left(4) = 0.0;
+        beta_left(5) = 0.0;
 
-        double left_ee_lin_vel_x_cntrl_sig = left_ee_lin_vel_x_pid.control(left_ee_lin_vel_x_error, DT);
-        double left_ee_lin_vel_y_cntrl_sig = left_ee_lin_vel_y_pid.control(left_ee_lin_vel_y_error, DT);
-        double left_ee_lin_vel_z_cntrl_sig = left_ee_lin_vel_z_pid.control(left_ee_lin_vel_z_error, DT);
-        double left_ee_ang_vel_x_cntrl_sig = left_ee_ang_vel_x_pid.control(left_ee_ang_vel_x_error, DT);
-        double left_ee_ang_vel_y_cntrl_sig = left_ee_ang_vel_y_pid.control(left_ee_ang_vel_y_error, DT);
-        double left_ee_ang_vel_z_cntrl_sig = left_ee_ang_vel_z_pid.control(left_ee_ang_vel_z_error, DT);
-        
-        beta_left(0) = left_ee_lin_vel_x_cntrl_sig;
-        beta_left(1) = left_ee_lin_vel_y_cntrl_sig;
-        beta_left(2) = left_ee_lin_vel_z_cntrl_sig;
-        beta_left(3) = left_ee_ang_vel_x_cntrl_sig;
-        beta_left(4) = left_ee_ang_vel_y_cntrl_sig;
-        beta_left(5) = left_ee_ang_vel_z_cntrl_sig;
-
-        KDL::JntArray limit_avoid_tau = compute_nullspace_limit_avoidance(
-            tmp_q, joint_limits, LIMIT_MARGIN, LIMIT_AVOIDANCE_GAIN);
-        for (int i = 0; i < num_joints_left; ++i) {
-            ff_taus(i) = limit_avoid_tau(i);
-        }
-
-        // Run vereshchagin solver using KDL temporaries and node-local qdd/tau containers
         int r = achd_solver_left.CartToJnt(
-                                tmp_q,
-                                tmp_qd,
-                                state.left_qdd,
+                                leftarm_q,
+                                leftarm_qd,
+                                leftarm_qdd,
                                 alpha_left, beta_left,
                                 f_ext, ff_taus,
-                                state.left_tau_cmd);
+                                leftarm_tau_cmd);
         if (r < 0) {
             LOG_ERROR(node, "Vereshchagin CartToJnt failed in main loop: %d", r);
-            // continue loop but avoid using invalid tau_cmd
         }
+
+        std::cout << "tau_cmd: " << leftarm_tau_cmd << std::endl;
+
         // clamp torques to max limits
         for (int i = 0; i < num_joints_left; ++i) {
-            state.left_tau_cmd(i) = std::clamp(state.left_tau_cmd(i), -TAU_MAX, TAU_MAX);
+            leftarm_tau_cmd(i) = std::clamp(leftarm_tau_cmd(i), -TAU_MAX, TAU_MAX);
         }
 
-        // update robot state for ROS publishing
-        state.left_ee_vel_error = KDL::Twist(
-            KDL::Vector(left_ee_lin_vel_x_error, left_ee_lin_vel_y_error, left_ee_lin_vel_z_error),
-            KDL::Vector(left_ee_ang_vel_x_error, left_ee_ang_vel_y_error, left_ee_ang_vel_z_error)
-        );
-        state.left_ee_vel_control_signal = KDL::Twist(
-            KDL::Vector(left_ee_lin_vel_x_cntrl_sig, left_ee_lin_vel_y_cntrl_sig, left_ee_lin_vel_z_cntrl_sig),
-            KDL::Vector(left_ee_ang_vel_x_cntrl_sig, left_ee_ang_vel_y_cntrl_sig, left_ee_ang_vel_z_cntrl_sig)
-        );
-
-        // Populate PID debug message for left_ee_ang_vel_z controller
-        double p_term, i_term, d_term, error_val, ctrl_sig;
-        left_ee_lin_vel_x_pid.get_debug_values(p_term, i_term, d_term, error_val, ctrl_sig);
-        state.left_ee_ang_vel_z_pid_debug.p = p_term;
-        state.left_ee_ang_vel_z_pid_debug.i = i_term;
-        state.left_ee_ang_vel_z_pid_debug.d = d_term;
-        state.left_ee_ang_vel_z_pid_debug.error = error_val;
-        state.left_ee_ang_vel_z_pid_debug.control_sig = ctrl_sig;
+        // udpate state
+        state.left_tau_cmd = leftarm_tau_cmd;
+        state.left_ee_fvel = left_ee_fvel;
 
         robot_state->update(state);
         
-    // (replaced by openarm_comm usage in cart_movement)
+        // update robot mit commands
+        for (int i = 0; i < NUM_JOINTS; ++i) {
+            leftarm_state.mit_cmd[i].tau = 0*leftarm_tau_cmd(i);
+        }
+        openarm_compl_ctrl::openarm_update(left_arm, leftarm_state, leftg_state);
+
+        // copy back
+        for (int i = 0; i < NUM_JOINTS; ++i) {
+            state.left.q[i] = leftarm_state.q[i];
+            state.left.qd[i] = leftarm_state.qd[i];
+            state.left.tau_mes[i] = leftarm_state.tau_mes[i];
+        }
+        state.left_gripper.q = leftg_state.q;
+        state.left_gripper.qd = leftg_state.qd;
+        state.left_gripper.tau_mes = leftg_state.tau_mes;
 
         while (now < deadline) {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
