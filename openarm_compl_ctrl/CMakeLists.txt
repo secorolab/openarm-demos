@@ -6,7 +6,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 set(CMAKE_C_STANDARD 99)
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
@@ -82,6 +82,46 @@ target_link_libraries(cart_movement_node
   openarm_comm
 )
 
+add_executable(achd_test src/achd_test.cpp)
+target_include_directories(achd_test PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
+ament_target_dependencies(achd_test
+  rclcpp
+  ament_index_cpp
+  std_msgs
+  sensor_msgs
+  geometry_msgs
+  bdd_ros2_interfaces
+  kdl_parser
+  orocos_kdl
+  openarm_description
+)
+target_link_libraries(achd_test 
+  OpenArmCAN::openarm_can
+  openarm_comm
+)
+
+add_executable(achd_ns_test src/achd_ns_test.cpp)
+target_include_directories(achd_test PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
+ament_target_dependencies(achd_ns_test
+  rclcpp
+  ament_index_cpp
+  std_msgs
+  sensor_msgs
+  geometry_msgs
+  bdd_ros2_interfaces
+  kdl_parser
+  orocos_kdl
+  openarm_description
+)
+target_link_libraries(achd_ns_test 
+  OpenArmCAN::openarm_can
+  openarm_comm
+)
+
 install(TARGETS openarm_comm
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
@@ -96,7 +136,7 @@ install(
   DESTINATION share/${PROJECT_NAME}/urdf
 )
 
-install(TARGETS cart_movement_node
+install(TARGETS cart_movement_node achd_test achd_ns_test
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
