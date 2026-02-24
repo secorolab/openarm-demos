@@ -113,19 +113,16 @@ void openarm_update(
     GripperState& gripper_state)
 {
     // Send MIT commands for arm and gripper (controller-provided)
-    // if (!arm_state.mit_cmd.empty()) {
-    //     arm.get_arm().mit_control_all(arm_state.mit_cmd);
-    // } else {
-    //     // If caller didn't provide commands, send zeros
-    //     std::vector<openarm::damiao_motor::MITParam> zeros;
-    //     zeros.reserve(NUM_JOINTS);
-    //     for (int i = 0; i < NUM_JOINTS; ++i) zeros.push_back(openarm::damiao_motor::MITParam{0,0,0,0,0});
-    //     arm.get_arm().mit_control_all(zeros);
-    // }
+    if (!arm_state.mit_cmd.empty()) {
+        arm.get_arm().mit_control_all(arm_state.mit_cmd);
+    } else {
+        // If no command provided, raise error
+        std::cerr << "Warning: No MIT command provided for arm joints. Sending zero commands." << std::endl;
+        arm.get_arm().mit_control_all(std::vector<openarm::damiao_motor::MITParam>(NUM_JOINTS, openarm::damiao_motor::MITParam{}));
+    }
 
-    // arm.get_gripper().mit_control_all(std::vector<openarm::damiao_motor::MITParam>{gripper_state.mit_cmd});
+    arm.get_gripper().mit_control_all(std::vector<openarm::damiao_motor::MITParam>{gripper_state.mit_cmd});
     
-    arm.refresh_all();
     arm.recv_all(100);
 
     for (int i = 0; i < NUM_JOINTS; ++i) {

@@ -16,7 +16,6 @@
 #include "kdl/treefksolverpos_recursive.hpp"
 #include "kdl/chainhdsolver_vereshchagin.hpp"
 #include "kdl/chainhdsolver_vereshchagin_fixed_joint.hpp"
-#include "kdl/chainhdsolver_vereshchagin_activeset.hpp"
 
 #define LOG_ERROR(node, msg, ...) RCLCPP_ERROR(node->get_logger(), msg, ##__VA_ARGS__)
 
@@ -54,8 +53,8 @@ int main(int argc, char **argv)
 
     if (!kdl_tree.getChain("openarm_left_link0", "openarm_left_link7",       chain_A)) { LOG_ERROR(node, "Failed chain A"); return -1; }
     if (!kdl_tree.getChain("world",              "openarm_left_link7",        chain_B)) { LOG_ERROR(node, "Failed chain B"); return -1; }
-    if (!kdl_tree.getChain("openarm_left_link0", "openarm_left_left_finger",  chain_C)) { LOG_ERROR(node, "Failed chain C"); return -1; }
-    if (!kdl_tree.getChain("world",              "openarm_left_left_finger",  chain_D)) { LOG_ERROR(node, "Failed chain D"); return -1; }
+    if (!kdl_tree.getChain("openarm_left_link0", "openarm_left_hand_tcp",  chain_C)) { LOG_ERROR(node, "Failed chain C"); return -1; }
+    if (!kdl_tree.getChain("world",              "openarm_left_hand_tcp",  chain_D)) { LOG_ERROR(node, "Failed chain D"); return -1; }
 
     RCLCPP_INFO(node->get_logger(), "Chain A: %d joints, %d segments  (link0->link7)",
                 chain_A.getNrOfJoints(), chain_A.getNrOfSegments());
@@ -116,10 +115,6 @@ int main(int argc, char **argv)
     KDL::ChainHdSolver_Vereshchagin_Fixed_Joint solver4(chain_C, root_acc_link0, nc);
     KDL::ChainHdSolver_Vereshchagin_Fixed_Joint solver5(chain_D, root_acc_world,  nc);
 
-    // ---- Solver 6: active-set joint limit projection (chain A) ----
-    KDL::ChainHdSolver_Vereshchagin_ActiveSet solver6(
-        chain_A, root_acc_link0, nc, q_lower, q_upper);
-
     // ---- Arrays ----
     const int ns_A=chain_A.getNrOfSegments();
     const int nj_B=chain_B.getNrOfJoints(), ns_B=chain_B.getNrOfSegments();
@@ -142,7 +137,7 @@ int main(int argc, char **argv)
         {   0, -100, 100,    0,    0,    0},
         {   0,    0,   0, 1000,    0,    0},
         {   0,    0,   0,    0, 1000,    0},
-        {   0,    0,   0,    0,    0, 1000},
+        {   0,    0,   0,    0,    0,  1000},
     };
 
     // ---- Run ----
@@ -163,21 +158,13 @@ int main(int argc, char **argv)
         solver3.CartToJnt(q_B, qd_B, qdd3, alpha_world,  beta, fext_B, ff_B, tau3);
         solver4.CartToJnt(q_C, qd_C, qdd4, alpha_link0, beta, fext_C, ff_C, tau4);
         solver5.CartToJnt(q_D, qd_D, qdd5, alpha_world,  beta, fext_D, ff_D, tau5);
-        solver6.CartToJnt(q_A, qd_A, qdd6, alpha_link0, beta, fext_A, ff_A, tau6);
-
-        // Active set: '.' = free, 'L' = locked at limit
-        const std::vector<bool>& active = solver6.getActiveSet();
-        std::string astr = "[";
-        for (int j = 0; j < nj_A; ++j) astr += (active[j] ? "L" : ".");
-        astr += "]";
 
         std::cout << "beta: " << beta << "\n";
-        std::cout << "  solver1 (orig,      A no limits):         " << tau1 << "\n";
-        std::cout << "  solver2 (FixedJoint,    A no limits):     " << tau2 << "\n";
-        std::cout << "  solver3 (FixedJoint,    B world->link7):  " << tau3 << "\n";
-        std::cout << "  solver4 (FixedJoint,    C link0->finger): " << tau4 << "\n";
-        std::cout << "  solver5 (FixedJoint,    D world->finger): " << tau5 << "\n";
-        std::cout << "  solver6 (activeset, A w/ limits):     " << tau6 << "  active:" << astr << "\n";
+        std::cout << "  solver1 (orig,          A link0->link7): " << tau1 << "\n";
+        std::cout << "  solver2 (FixedJoint,    A link0->link7): " << tau2 << "\n";
+        std::cout << "  solver3 (FixedJoint,    B world->link7): " << tau3 << "\n";
+        std::cout << "  solver4 (FixedJoint,    C link0->tcp):   " << tau4 << "\n";
+        std::cout << "  solver5 (FixedJoint,    D world->tcp):   " << tau5 << "\n";
         std::cout << "\n";
     }
 

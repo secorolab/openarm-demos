@@ -32,6 +32,7 @@
 #include "kdl/treefksolverpos_recursive.hpp"
 #include "kdl/chainfksolvervel_recursive.hpp"
 #include "kdl/chainhdsolver_vereshchagin.hpp"
+#include "kdl/chainhdsolver_vereshchagin_fixed_joint.hpp"
 #include "kdl/chainhdsolver_vereshchagin_fext.hpp"
 
 #include <openarm/can/socket/openarm.hpp>
@@ -191,8 +192,8 @@ public:
 
         // ----- Derivative (filtered) -----
         double raw_derivative = (error - previous_error_) / dt;
-        // d_term_ = kd_ * raw_derivative;
-        d_term_ = kd_ * derivative_filter_.update(raw_derivative);
+        d_term_ = kd_ * raw_derivative;
+        // d_term_ = kd_ * derivative_filter_.update(raw_derivative);
 
         // ----- Integral Update (before computing output) -----
         if (ki_ != 0.0) {
@@ -382,7 +383,7 @@ public:
             "/debug_ee_vel_cntrl_sig", 10);
 
         pid_debug_pub_ = create_publisher<openarm_compl_ctrl::msg::PIDDebug>(
-            "/pid_debug_left_ee_ang_vel_z", 10);
+            "/pid_debug", 10);
 
         // Publishing timer - can handle bursts
         publish_timer_ = create_wall_timer(
@@ -514,37 +515,26 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    KDL::Chain left_arm_chain, right_arm_chain;
-    KDL::Chain world_left_base_chain, world_right_base_chain;
-    if (!kdl_tree.getChain("openarm_left_link0", "openarm_left_link7", left_arm_chain) ||
-        !kdl_tree.getChain("openarm_right_link0", "openarm_right_link7", right_arm_chain ) ||
-        !kdl_tree.getChain("world", "openarm_left_link0", world_left_base_chain) ||
-        !kdl_tree.getChain("world", "openarm_right_link0", world_right_base_chain)) {
+    KDL::Chain left_arm_chain;
+    
+    constexpr const char* WORLD_LINK = "world";
+    constexpr const char* LEFT_ARM_BASE_LINK = "openarm_left_link0";
+    constexpr const char* LEFT_ARM_LINK7 = "openarm_left_link7";
+    constexpr const char* LEFT_ARM_TCP_LINK = "openarm_left_hand_tcp";
+
+    if (!kdl_tree.getChain(WORLD_LINK, LEFT_ARM_TCP_LINK, left_arm_chain)) {
         LOG_ERROR(node, "Failed to extract KDL chains from URDF");
         return -1;
     }
 
     KDL::Vector gravity_vec(0, 0, -9.81);
 
-    KDL::TreeFkSolverPos_recursive fk_solver(kdl_tree);
-    KDL::JntArray q(kdl_tree.getNrOfJoints());
-    
-    KDL::Frame f_left_base, f_right_base;
-    fk_solver.JntToCart(q, f_left_base, "openarm_left_link0");
-    fk_solver.JntToCart(q, f_right_base, "openarm_right_link0");
- 
-    KDL::Vector g_left_base = f_left_base.M.Inverse() * gravity_vec;
-    KDL::Vector g_right_base = f_right_base.M.Inverse() * gravity_vec;
-
     LOG_INFO(node, "Successfully parsed URDF and extracted KDL chains");
 
     constexpr double ee_mass = 0.42205099999999995;
 
     int num_joints_left = left_arm_chain.getNrOfJoints();
-    int num_joints_right = right_arm_chain.getNrOfJoints();
-
     int num_segments_left = left_arm_chain.getNrOfSegments();
-    int num_segments_right = right_arm_chain.getNrOfSegments();
 
     // print link names and joint names for debugging
     LOG_INFO(node, "Left arm has %d joints:", num_joints_left);
@@ -555,25 +545,8 @@ int main(int argc, char **argv) {
             LOG_INFO(node, "    Joint: %s", segment.getJoint().getName().c_str());
         }
     }
-    LOG_INFO(node, "Right arm has %d joints:", num_joints_right);
-    for (size_t i = 0; i < right_arm_chain.getNrOfSegments(); ++i) {
-        const auto& segment = right_arm_chain.getSegment(i);
-        LOG_INFO(node, "  Segment %zu: %s", i, segment.getName().c_str());
-        if (segment.getJoint().getType() != KDL::Joint::None) {
-            LOG_INFO(node, "    Joint: %s", segment.getJoint().getName().c_str());
-        }
-    }
-
     assert(num_joints_left == NUM_JOINTS && "Left arm has unexpected number of joints");
-    assert(num_joints_right == NUM_JOINTS && "Right arm has unexpected number of joints");
-
     LOG_INFO(node, "Left arm chain has %d segments and %d joints", num_segments_left, num_joints_left);
-
-    assert(num_segments_left == num_joints_left && "Left arm has unexpected number of segments");
-    assert(num_segments_right == num_joints_right && "Right arm has unexpected number of segments");
-    
-    LOG_INFO_S(node, "Left arm gravity in base frame: " << g_left_base);
-    LOG_INFO_S(node, "Right arm gravity in base frame: " << g_right_base);
 
     // --------------------- State ----------------------
 
@@ -581,17 +554,13 @@ int main(int argc, char **argv) {
 
     // --------------------- Vereshchagin Config ---------------------
     KDL::Twist g_left_arm(
-        KDL::Vector(-g_left_base.x(), -g_left_base.y(), -g_left_base.z()),
+        KDL::Vector(-gravity_vec.x(), -gravity_vec.y(), -gravity_vec.z()),
         KDL::Vector::Zero()
     );
-    KDL::Twist g_right_arm(
-        KDL::Vector(-g_right_base.x(), -g_right_base.y(), -g_right_base.z()),
-        KDL::Vector::Zero()
-    );
-    
+   
     int num_constraints = 6;
 
-    KDL::ChainHdSolver_Vereshchagin achd_solver_left(left_arm_chain, g_left_arm, num_constraints);
+    KDL::ChainHdSolver_Vereshchagin_Fixed_Joint achd_solver_left(left_arm_chain, g_left_arm, num_constraints);
 
     KDL::JntArray ff_taus(num_joints_left);
 
@@ -609,22 +578,14 @@ int main(int argc, char **argv) {
     
     alpha_left_world.setColumn(0, KDL::Twist(KDL::Vector(1, 0, 0), KDL::Vector(0, 0, 0)));
     alpha_left_world.setColumn(1, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
-    alpha_left_world.setColumn(2, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
+    alpha_left_world.setColumn(2, KDL::Twist(KDL::Vector(0, 0, 1), KDL::Vector(0, 0, 0))); 
     alpha_left_world.setColumn(3, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
     alpha_left_world.setColumn(4, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
     alpha_left_world.setColumn(5, KDL::Twist(KDL::Vector(0, 0, 0), KDL::Vector(0, 0, 0))); 
            
-    // transform world to respective arm base frame
-    KDL::Frame f_left_base_inv = f_left_base.Inverse();
-
-    KDL::Jacobian alpha_left(num_constraints);
-    for (int i = 0; i < num_constraints; ++i) {
-        alpha_left.setColumn(i, f_left_base_inv * alpha_left_world.getColumn(i));
-    }
-
     KDL::ChainFkSolverVel_recursive fk_vel_solver_left(left_arm_chain);
 
-    KDL::FrameVel left_ee_fvel, right_ee_fvel;
+    KDL::FrameVel left_ee_fvel;
     KDL::JntArrayVel left_q_qd(num_joints_left);
 
     fk_vel_solver_left.JntToCart(left_q_qd, left_ee_fvel);
@@ -639,13 +600,16 @@ int main(int argc, char **argv) {
                                     tmp_q,
                                     tmp_qd,
                                     state.left_qdd,
-                                    alpha_left, beta_left, 
+                                    alpha_left_world, beta_left, 
                                     f_ext, ff_taus, 
                                     state.left_tau_cmd);
     if (r < 0) {
         LOG_ERROR(node, "Failed to compute feedforward torques for left arm: %d", r);
         return -1;
     }
+
+    // zero out the initial command to avoid any unexpected motion at startup
+    state.left_tau_cmd.data.setZero();
 
     // Use defaults provided by openarm_comm; override interface if needed
     ArmHardwareConfig left_arm_config = openarm_compl_ctrl::make_default_arm_config("can1");
@@ -670,12 +634,12 @@ int main(int argc, char **argv) {
         std::vector<openarm::damiao_motor::MITParam> mit;
         mit.reserve(NUM_JOINTS);
         for (int i = 0; i < NUM_JOINTS; ++i) {
-            mit.push_back(openarm::damiao_motor::MITParam{0.0,0.0,0.0,0.0,state.left_tau_cmd(i)});
+            mit.push_back(openarm::damiao_motor::MITParam{0.0,0.0,0.0,0.0,0.0});
         }
         astate.mit_cmd = std::move(mit);
     }
     // No gripper torque command at startup; send zero command
-    gstate.g_mit_cmd = openarm::damiao_motor::MITParam{0.0,0.0,0.0,0.0,0.0};
+    gstate.mit_cmd = openarm::damiao_motor::MITParam{0.0,0.0,0.0,0.0,0.0};
     openarm_compl_ctrl::openarm_update(left_arm, astate, gstate);
     for (int i = 0; i < 7; ++i) {
         state.left.q[i] = astate.q[i];
@@ -686,7 +650,7 @@ int main(int argc, char **argv) {
     state.left_gripper.qd = gstate.qd;
     state.left_gripper.tau_mes = gstate.tau_mes;
  
-    double left_ee_lin_vel_x_sp = -0.1; // m/s
+    double left_ee_lin_vel_x_sp = 0.05; // m/s
     double left_ee_lin_vel_y_sp = 0.0; // m/s
     double left_ee_lin_vel_z_sp = 0.0; // m/s
 
@@ -696,13 +660,14 @@ int main(int argc, char **argv) {
     double left_ee_ang_vel_z_sp = 0.0; // rad/s
     
     // PID controllers
-    PIDController left_ee_lin_vel_x_pid(100.0, 0.0, 0.5, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
-    PIDController left_ee_lin_vel_y_pid(0.0, 0.0, 0.0, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
-    PIDController left_ee_lin_vel_z_pid(0.0, 0.0, 0.0, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
+    PIDController left_ee_lin_vel_x_pid(100.0, 50.0, 0.1, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
+    PIDController left_ee_lin_vel_y_pid(50.0, 10.0, 0.0, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
+    PIDController left_ee_lin_vel_z_pid(100.0, 50.0, 0.0, -100.0, 100.0, 10.0, 1000.0, 0.9, 0.0);
 
     // with P=300, orientation works. 
     // > 300 causes oscillations
     PIDController left_ee_ang_vel_x_pid(0.0, 0.0, 0.0, -500.0, 500.0, 10.0, 1000.0, 0.9, 0.0);
+    // PIDController left_ee_ang_vel_y_pid(200.0, 100.0, 0.1, -500.0, 500.0, 10.0, 1000.0, 0.9, 0.0);
     PIDController left_ee_ang_vel_y_pid(0.0, 0.0, 0.0, -500.0, 500.0, 10.0, 1000.0, 0.9, 0.0);
     PIDController left_ee_ang_vel_z_pid(0.0, 0.0, 0.0, -1000.0, 1000.0, 10.0, 1000.0, 0.9, 0.0);
 
@@ -731,20 +696,20 @@ int main(int argc, char **argv) {
         fk_vel_solver_left.JntToCart(left_q_qd, left_ee_fvel);
 
         KDL::Frame left_ee_frame = left_ee_fvel.GetFrame();
+        double r, p, y;
+        left_ee_frame.M.GetRPY(r, p, y);
         KDL::Twist left_ee_vel = left_ee_fvel.GetTwist();
+        // std::cout << "left ee:     " << left_ee_frame.p << " [" << r << ", " << p << ", " << y << "]" << std::endl;
+        // std::cout << "left ee vel: " << left_ee_vel << std::endl;
 
-        KDL::Frame left_ee_frame_world = f_left_base * left_ee_frame;
-        KDL::Twist left_ee_vel_world = f_left_base * left_ee_vel;
-
-        // Store KDL-only values in node-local fields
-        state.left_ee_fvel = KDL::FrameVel(left_ee_frame_world, left_ee_vel_world);
-
-        double left_ee_lin_vel_x = left_ee_vel_world.vel.x();
-        double left_ee_lin_vel_y = left_ee_vel_world.vel.y();
-        double left_ee_lin_vel_z = left_ee_vel_world.vel.z();
-        double left_ee_ang_vel_x = left_ee_vel_world.rot.x();
-        double left_ee_ang_vel_y = left_ee_vel_world.rot.y();
-        double left_ee_ang_vel_z = left_ee_vel_world.rot.z();
+        state.left_ee_fvel = left_ee_fvel;
+        
+        double left_ee_lin_vel_x = left_ee_vel.vel.x();
+        double left_ee_lin_vel_y = left_ee_vel.vel.y();
+        double left_ee_lin_vel_z = left_ee_vel.vel.z();
+        double left_ee_ang_vel_x = left_ee_vel.rot.x();
+        double left_ee_ang_vel_y = left_ee_vel.rot.y();
+        double left_ee_ang_vel_z = left_ee_vel.rot.z();
 
         double left_ee_lin_vel_x_error = evaluate_equality_constraint(left_ee_lin_vel_x, left_ee_lin_vel_x_sp);
         double left_ee_lin_vel_y_error = evaluate_equality_constraint(left_ee_lin_vel_y, left_ee_lin_vel_y_sp);
@@ -774,16 +739,16 @@ int main(int argc, char **argv) {
         }
 
         // Run vereshchagin solver using KDL temporaries and node-local qdd/tau containers
-        int r = achd_solver_left.CartToJnt(
+        int res = achd_solver_left.CartToJnt(
                                 tmp_q,
                                 tmp_qd,
                                 state.left_qdd,
-                                alpha_left, beta_left,
+                                alpha_left_world, beta_left,
                                 f_ext, ff_taus,
                                 state.left_tau_cmd);
-        if (r < 0) {
-            LOG_ERROR(node, "Vereshchagin CartToJnt failed in main loop: %d", r);
-            // continue loop but avoid using invalid tau_cmd
+        if (res < 0) {
+            LOG_ERROR(node, "Vereshchagin CartToJnt failed in main loop: %d", res);
+            break;
         }
         // clamp torques to max limits
         for (int i = 0; i < num_joints_left; ++i) {
@@ -811,7 +776,18 @@ int main(int argc, char **argv) {
 
         robot_state->update(state);
         
-    // (replaced by openarm_comm usage in cart_movement)
+        std::cout << "tau: " << state.left_tau_cmd << std::endl;
+        state.left.mit_cmd = std::vector<openarm::damiao_motor::MITParam>({
+            openarm::damiao_motor::MITParam{0.0, 0.0, 0.0, 0.0, state.left_tau_cmd(0)},
+            openarm::damiao_motor::MITParam{0.0, 0.0, 0.0, 0.0, state.left_tau_cmd(1)},
+            openarm::damiao_motor::MITParam{0.0, 0.0, 0.0, 0.0, state.left_tau_cmd(2)},
+            openarm::damiao_motor::MITParam{0.0, 0.0, 0.0, 0.0, state.left_tau_cmd(3)},
+            openarm::damiao_motor::MITParam{0.0, 0.0, 0.0, 0.0, state.left_tau_cmd(4)},
+            openarm::damiao_motor::MITParam{0.0, 0.0, 0.0, 0.0, state.left_tau_cmd(5)},
+            openarm::damiao_motor::MITParam{0.0, 0.0, 0.0, 0.0, state.left_tau_cmd(6)}
+        });
+        state.left_gripper.mit_cmd = openarm::damiao_motor::MITParam{0.0, 0.0, 0.0, 0.0, 0.0};
+        openarm_update(left_arm, state.left, state.left_gripper);
 
         while (now < deadline) {
             std::this_thread::sleep_for(std::chrono::microseconds(100));

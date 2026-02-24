@@ -15,7 +15,7 @@
 #include "kdl/jntarray.hpp"
 #include "kdl/treefksolverpos_recursive.hpp"
 #include "kdl/chainhdsolver_vereshchagin.hpp"
-#include "kdl/chainhdsolver_vereshchagin_claude.hpp"
+#include "kdl/chainhdsolver_vereshchagin_fixed_joint.hpp"
 
 #define LOG_ERROR(node, msg, ...) RCLCPP_ERROR(node->get_logger(), msg, ##__VA_ARGS__)
 
@@ -112,10 +112,10 @@ int main(int argc, char **argv)
 
     // ---- Solvers ----
     KDL::ChainHdSolver_Vereshchagin        solver1(chain_A, root_acc_link0, nc);  // original, chain A
-    KDL::ChainHdSolver_Vereshchagin_Claude solver2(chain_A, root_acc_link0, nc);  // claude,   chain A  (sanity == solver1)
-    KDL::ChainHdSolver_Vereshchagin_Claude solver3(chain_B, root_acc_world, nc);  // claude,   chain B  (fixed prefix, same tip as A → must == solver1)
-    KDL::ChainHdSolver_Vereshchagin_Claude solver4(chain_C, root_acc_link0, nc);  // claude,   chain C  (fixed suffix)
-    KDL::ChainHdSolver_Vereshchagin_Claude solver5(chain_D, root_acc_world, nc);  // claude,   chain D  (fixed prefix+suffix)
+    KDL::ChainHdSolver_Vereshchagin_Fixed_Joint solver2(chain_A, root_acc_link0, nc);  // fixed_joint,   chain A  (sanity == solver1)
+    KDL::ChainHdSolver_Vereshchagin_Fixed_Joint solver3(chain_B, root_acc_world, nc);  // fixed_joint,   chain B  (fixed prefix, same tip as A → must == solver1)
+    KDL::ChainHdSolver_Vereshchagin_Fixed_Joint solver4(chain_C, root_acc_link0, nc);  // fixed_joint,   chain C  (fixed suffix)
+    KDL::ChainHdSolver_Vereshchagin_Fixed_Joint solver5(chain_D, root_acc_world, nc);  // fixed_joint,   chain D  (fixed prefix+suffix)
 
     // ---- Arrays ----
     const int nj_A=chain_A.getNrOfJoints(), ns_A=chain_A.getNrOfSegments();
@@ -162,10 +162,10 @@ int main(int argc, char **argv)
 
         std::cout << "beta: " << beta << "\n";
         std::cout << "  solver1 (orig,   A link0->link7):         " << (r1==0 ? tau1 : make_jnt(nj_A)) << "\n";
-        std::cout << "  solver2 (claude, A link0->link7):         " << (r2==0 ? tau2 : make_jnt(nj_A)) << "\n";
-        std::cout << "  solver3 (claude, B world->link7):         " << (r3==0 ? tau3 : make_jnt(nj_B)) << "\n";
-        std::cout << "  solver4 (claude, C link0->finger):        " << (r4==0 ? tau4 : make_jnt(nj_C)) << "\n";
-        std::cout << "  solver5 (claude, D world->finger):        " << (r5==0 ? tau5 : make_jnt(nj_D)) << "\n";
+        std::cout << "  solver2 (fixed_joint, A link0->link7):         " << (r2==0 ? tau2 : make_jnt(nj_A)) << "\n";
+        std::cout << "  solver3 (fixed_joint, B world->link7):         " << (r3==0 ? tau3 : make_jnt(nj_B)) << "\n";
+        std::cout << "  solver4 (fixed_joint, C link0->finger):        " << (r4==0 ? tau4 : make_jnt(nj_C)) << "\n";
+        std::cout << "  solver5 (fixed_joint, D world->finger):        " << (r5==0 ? tau5 : make_jnt(nj_D)) << "\n";
         std::cout << "\n";
     }
 
